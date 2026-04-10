@@ -202,7 +202,7 @@ impl UserDictionaryBuilder {
         let mut keyset: Vec<(&[u8], u32)> = vec![];
         for (key, word_entries) in &word_entry_map {
             let len = word_entries.len() as u32;
-            let val = (id << 5) | len;
+            let val = (id << 8) | len;
             keyset.push((key.as_bytes(), val));
             id += len;
         }

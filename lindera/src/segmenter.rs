@@ -333,16 +333,11 @@ impl Segmenter {
             );
             // Forward Viterbi implementation handles cost calculation within `set_text`.
 
-            let offsets = lattice.tokens_offset();
+            let offsets = lattice.tokens_offset_with_stop();
 
             for i in 0..offsets.len() {
-                let (byte_start, word_id) = offsets[i];
-                let byte_end = if i == offsets.len() - 1 {
-                    sentence.len()
-                } else {
-                    let (next_start, _word_id) = offsets[i + 1];
-                    next_start
-                };
+                let (byte_start, byte_end, word_id) = offsets[i];
+                let _ = i; // byte_end now comes from the offset itself
 
                 // Calculate absolute position in the original text
                 let absolute_start = sentence_start + byte_start;
