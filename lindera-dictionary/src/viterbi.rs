@@ -466,8 +466,7 @@ impl Lattice {
             // potential left edges and can compute the connection cost
             // directly to each one — exactly what mecab-ko does. The
             // `is_space` flag triggers the left-space-penalty when applicable.
-            let next_offset =
-                self.char_info_buffer[char_idx + 1].byte_offset as usize;
+            let next_offset = self.char_info_buffer[char_idx + 1].byte_offset as usize;
             if Self::is_whitespace_range(text, start, next_offset) {
                 let edges_to_copy = self.ends_at[start].clone();
                 for mut e in edges_to_copy {
@@ -1075,8 +1074,7 @@ impl Lattice {
             }
 
             // SPACE handling — see set_text() for explanation
-            let next_offset =
-                self.char_info_buffer[char_idx + 1].byte_offset as usize;
+            let next_offset = self.char_info_buffer[char_idx + 1].byte_offset as usize;
             if Self::is_whitespace_range(text, start, next_offset) {
                 let edges_to_copy = self.ends_at[start].clone();
                 for mut e in edges_to_copy {
