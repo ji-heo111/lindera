@@ -335,15 +335,66 @@ impl Segmenter {
 
             let offsets = lattice.tokens_offset_with_stop();
 
-            for i in 0..offsets.len() {
-                let (byte_start, byte_end, word_id) = offsets[i];
-                let _ = i; // byte_end now comes from the offset itself
+            // The lattice's COPY-on-space optimization causes whitespace bytes
+            // to be skipped entirely — they appear as gaps between consecutive
+            // token edges rather than as explicit SPACE tokens. Track the end
+            // of the previous token so we can emit synthetic whitespace tokens
+            // for those gaps when `keep_whitespace = true`.
+            let mut prev_token_byte_end: usize = 0;
+
+            for (byte_start, byte_end, word_id) in offsets.iter().copied() {
+                // Detect a gap between the previous token and this one. Any
+                // such gap must be whitespace bytes that the lattice skipped
+                // via COPY-on-space.
+                if byte_start > prev_token_byte_end {
+                    let gap_start = prev_token_byte_end;
+                    let gap_end = byte_start;
+
+                    if self.keep_whitespace {
+                        // Emit a synthetic whitespace token. Use a default
+                        // WordId (0, System) since the space byte is not a
+                        // dictionary entry. The segmenter's caller reads the
+                        // surface directly from the text slice, which is what
+                        // matters for `keep_whitespace` semantics.
+                        let abs_gap_start = sentence_start + gap_start;
+                        let abs_gap_end = sentence_start + gap_end;
+                        let surface_cow = match &text {
+                            Cow::Borrowed(s) => Cow::Borrowed(&s[abs_gap_start..abs_gap_end]),
+                            Cow::Owned(s) => Cow::Owned(s[abs_gap_start..abs_gap_end].to_owned()),
+                        };
+                        let token_start = byte_position;
+                        byte_position += gap_end - gap_start;
+                        let token_end = byte_position;
+
+                        tokens.push(Token::new(
+                            surface_cow,
+                            token_start,
+                            token_end,
+                            position,
+                            lindera_dictionary::viterbi::WordId::default(),
+                            &self.dictionary,
+                            self.user_dictionary.as_ref(),
+                        ));
+                        position += 1;
+                    } else {
+                        // Default MeCab behavior: drop whitespace, but still
+                        // advance `byte_position` so downstream token offsets
+                        // stay consistent with the input text.
+                        byte_position += gap_end - gap_start;
+                    }
+                }
+
+                prev_token_byte_end = byte_end;
 
                 // Calculate absolute position in the original text
                 let absolute_start = sentence_start + byte_start;
                 let absolute_end = sentence_start + byte_end;
 
-                // Skip whitespace tokens if keep_whitespace is false (default MeCab behavior)
+                // Skip whitespace tokens if keep_whitespace is false (default MeCab behavior).
+                // This branch handles the case where the lattice DID emit a
+                // whitespace token (e.g., an UNKNOWN edge covering a space
+                // char that wasn't skipped by COPY-on-space, which can happen
+                // for unusual whitespace-adjacent categories).
                 if !self.keep_whitespace
                     && let Some(space_category_id) = self.space_category_id
                 {

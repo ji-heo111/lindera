@@ -396,12 +396,10 @@ impl Lattice {
         let mut matches_head = vec![usize::MAX; len + 1];
         let mut matches_store: Vec<(usize, WordEntry, usize)> = Vec::with_capacity(len * 10);
 
-        // System dictionary scan
+        // System dictionary scan (8-bit variant-count encoding)
         for m in dict.da.find_overlapping_iter(text) {
             let start = m.start();
-            let id = m.value();
-            let count = id & ((1u32 << 8) - 1u32);
-            let offset = id >> 8u32;
+            let (offset, count) = dict.decode_val(m.value());
             let offset_bytes = (offset as usize) * WordEntry::SERIALIZED_LEN;
 
             // Bounds check for safety, though daachorse should guarantee valid ids if built correctly
@@ -421,13 +419,11 @@ impl Lattice {
             }
         }
 
-        // User dictionary scan
+        // User dictionary scan (5-bit variant-count encoding for bwd compat)
         if let Some(ud) = user_dict {
             for m in ud.da.find_overlapping_iter(text) {
                 let start = m.start();
-                let id = m.value();
-                let count = id & ((1u32 << 8) - 1u32);
-                let offset = id >> 8u32;
+                let (offset, count) = ud.decode_val(m.value());
                 let offset_bytes = (offset as usize) * WordEntry::SERIALIZED_LEN;
 
                 if offset_bytes < ud.vals_data.len() {
@@ -640,13 +636,17 @@ impl Lattice {
             return;
         }
 
-        // Look up the left-space-penalty for this edge's POS once
-        // (only known/system entries have non-zero penalties).
-        let space_penalty = if matches!(edge.edge_type, EdgeType::KNOWN) {
-            dict.get_space_penalty(edge.word_entry.word_id.id)
-        } else {
-            0
-        };
+        // Look up the left-space-penalty for this edge's POS once.
+        // Only SYSTEM dictionary entries have meaningful penalties, and the
+        // `space_penalty_table` is indexed by the system dict's word_id space.
+        // Skip the lookup for user dictionary or unknown entries to avoid
+        // out-of-bounds / wrong-namespace reads.
+        let space_penalty =
+            if matches!(edge.edge_type, EdgeType::KNOWN) && edge.word_entry.word_id.is_system() {
+                dict.get_space_penalty(edge.word_entry.word_id.id)
+            } else {
+                0
+            };
 
         let mut best_cost = i32::MAX;
         let mut best_left = None;
@@ -789,11 +789,12 @@ impl Lattice {
             return;
         }
 
-        let space_penalty = if matches!(edge.edge_type, EdgeType::KNOWN) {
-            dict.get_space_penalty(edge.word_entry.word_id.id)
-        } else {
-            0
-        };
+        let space_penalty =
+            if matches!(edge.edge_type, EdgeType::KNOWN) && edge.word_entry.word_id.is_system() {
+                dict.get_space_penalty(edge.word_entry.word_id.id)
+            } else {
+                0
+            };
 
         let mut best_cost = i32::MAX;
         let mut best_left = None;
@@ -1016,12 +1017,10 @@ impl Lattice {
         let mut matches_head = vec![usize::MAX; len + 1];
         let mut matches_store: Vec<(usize, WordEntry, usize)> = Vec::with_capacity(len * 10);
 
-        // System dictionary scan
+        // System dictionary scan (8-bit variant-count encoding)
         for m in dict.da.find_overlapping_iter(text) {
             let start = m.start();
-            let id = m.value();
-            let count = id & ((1u32 << 8) - 1u32);
-            let offset = id >> 8u32;
+            let (offset, count) = dict.decode_val(m.value());
             let offset_bytes = (offset as usize) * WordEntry::SERIALIZED_LEN;
 
             if offset_bytes < dict.vals_data.len() {
@@ -1040,13 +1039,11 @@ impl Lattice {
             }
         }
 
-        // User dictionary scan
+        // User dictionary scan (5-bit variant-count encoding for bwd compat)
         if let Some(ud) = user_dict {
             for m in ud.da.find_overlapping_iter(text) {
                 let start = m.start();
-                let id = m.value();
-                let count = id & ((1u32 << 8) - 1u32);
-                let offset = id >> 8u32;
+                let (offset, count) = ud.decode_val(m.value());
                 let offset_bytes = (offset as usize) * WordEntry::SERIALIZED_LEN;
 
                 if offset_bytes < ud.vals_data.len() {
