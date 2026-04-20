@@ -169,6 +169,9 @@ pub struct Edge {
     pub stop_index: u32,
 
     pub kanji_only: bool,
+    /// True if this edge's surface is only whitespace.
+    /// Used by the Korean left-space-penalty feature.
+    pub is_space: bool,
 }
 
 impl Edge {
@@ -241,7 +244,17 @@ impl Lattice {
             stop_index: stop as u32,
             path_cost: i32::MAX,
             kanji_only,
+            is_space: false,
         }
+    }
+
+    /// Check if the byte range [start, stop) of `text` is purely whitespace.
+    #[inline]
+    fn is_whitespace_range(text: &str, start: usize, stop: usize) -> bool {
+        if start >= stop || stop > text.len() {
+            return false;
+        }
+        text[start..stop].chars().all(char::is_whitespace)
     }
 
     pub fn clear(&mut self) {
@@ -449,14 +462,15 @@ impl Lattice {
 
                     let prefix_len = end - start;
                     let kanji_only = self.is_kanji_all(char_idx, prefix_len);
-                    let edge = Self::create_edge(
+                    let mut edge = Self::create_edge(
                         EdgeType::KNOWN,
                         word_entry, // WordEntry is Copy
                         start,
                         end,
                         kanji_only,
                     );
-                    self.add_edge_in_lattice(edge, cost_matrix, search_mode);
+                    edge.is_space = Self::is_whitespace_range(text, start, end);
+                    self.add_edge_in_lattice(edge, dict, cost_matrix, search_mode);
                     found = true;
 
                     match_idx = next;
@@ -472,6 +486,8 @@ impl Lattice {
                 for category_ord in 0..num_categories {
                     let category = self.get_cached_category(char_idx, category_ord);
                     unknown_word_end = self.process_unknown_word(
+                        dict,
+                        text,
                         char_definitions,
                         unknown_dictionary,
                         cost_matrix,
@@ -520,6 +536,8 @@ impl Lattice {
     #[allow(clippy::too_many_arguments)]
     fn process_unknown_word(
         &mut self,
+        dict: &PrefixDictionary,
+        text: &str,
         char_definitions: &CharacterDefinition,
         unknown_dictionary: &UnknownDictionary,
         cost_matrix: &ConnectionCostMatrix,
@@ -566,14 +584,15 @@ impl Lattice {
 
             for &word_id in unknown_dictionary.lookup_word_ids(category) {
                 let word_entry = unknown_dictionary.word_entry(word_id);
-                let edge = Self::create_edge(
+                let mut edge = Self::create_edge(
                     EdgeType::UNKNOWN,
                     word_entry,
                     start,
                     start + byte_len,
                     kanji_only,
                 );
-                self.add_edge_in_lattice(edge, cost_matrix, search_mode);
+                edge.is_space = Self::is_whitespace_range(text, start, start + byte_len);
+                self.add_edge_in_lattice(edge, dict, cost_matrix, search_mode);
             }
             return Some(start + byte_len);
         }
@@ -584,6 +603,7 @@ impl Lattice {
     fn add_edge_in_lattice(
         &mut self,
         mut edge: Edge,
+        dict: &PrefixDictionary,
         cost_matrix: &ConnectionCostMatrix,
         mode: &Mode,
     ) {
@@ -596,6 +616,18 @@ impl Lattice {
             return;
         }
 
+        // Look up the left-space-penalty for this edge's POS once.
+        // Only SYSTEM dictionary entries have meaningful penalties, and the
+        // `space_penalty_table` is indexed by the system dict's word_id space.
+        // Skip the lookup for user dictionary or unknown entries to avoid
+        // out-of-bounds / wrong-namespace reads.
+        let space_penalty =
+            if matches!(edge.edge_type, EdgeType::KNOWN) && edge.word_entry.word_id.is_system() {
+                dict.get_space_penalty(edge.word_entry.word_id.id)
+            } else {
+                0
+            };
+
         let mut best_cost = i32::MAX;
         let mut best_left = None;
 
@@ -604,7 +636,10 @@ impl Lattice {
                 for (i, left_edge) in left_edges.iter().enumerate() {
                     let left_right_id = left_edge.word_entry.right_id();
                     let conn_cost = cost_matrix.cost(left_right_id, right_left_id);
-                    let total_cost = left_edge.path_cost.saturating_add(conn_cost);
+                    let mut total_cost = left_edge.path_cost.saturating_add(conn_cost);
+                    if left_edge.is_space && space_penalty != 0 {
+                        total_cost = total_cost.saturating_add(space_penalty);
+                    }
 
                     if total_cost < best_cost {
                         best_cost = total_cost;
@@ -617,10 +652,13 @@ impl Lattice {
                     let left_right_id = left_edge.word_entry.right_id();
                     let conn_cost = cost_matrix.cost(left_right_id, right_left_id);
                     let penalty_cost = penalty.penalty(left_edge);
-                    let total_cost = left_edge
+                    let mut total_cost = left_edge
                         .path_cost
                         .saturating_add(conn_cost)
                         .saturating_add(penalty_cost);
+                    if left_edge.is_space && space_penalty != 0 {
+                        total_cost = total_cost.saturating_add(space_penalty);
+                    }
 
                     if total_cost < best_cost {
                         best_cost = total_cost;
@@ -704,6 +742,7 @@ impl Lattice {
     fn add_edge_in_lattice_nbest(
         &mut self,
         mut edge: Edge,
+        dict: &PrefixDictionary,
         cost_matrix: &ConnectionCostMatrix,
         mode: &Mode,
     ) {
@@ -716,6 +755,13 @@ impl Lattice {
             return;
         }
 
+        let space_penalty =
+            if matches!(edge.edge_type, EdgeType::KNOWN) && edge.word_entry.word_id.is_system() {
+                dict.get_space_penalty(edge.word_entry.word_id.id)
+            } else {
+                0
+            };
+
         let mut best_cost = i32::MAX;
         let mut best_left = None;
 
@@ -727,7 +773,10 @@ impl Lattice {
                 for (i, left_edge) in left_edges.iter().enumerate() {
                     let left_right_id = left_edge.word_entry.right_id();
                     let conn_cost = cost_matrix.cost(left_right_id, right_left_id);
-                    let total_cost = left_edge.path_cost.saturating_add(conn_cost);
+                    let mut total_cost = left_edge.path_cost.saturating_add(conn_cost);
+                    if left_edge.is_space && space_penalty != 0 {
+                        total_cost = total_cost.saturating_add(space_penalty);
+                    }
 
                     // Record ALL transitions for N-Best
                     self.all_paths[stop_index].push(PathEntry {
@@ -748,10 +797,13 @@ impl Lattice {
                     let left_right_id = left_edge.word_entry.right_id();
                     let conn_cost = cost_matrix.cost(left_right_id, right_left_id);
                     let penalty_cost = penalty.penalty(left_edge);
-                    let total_cost = left_edge
+                    let mut total_cost = left_edge
                         .path_cost
                         .saturating_add(conn_cost)
                         .saturating_add(penalty_cost);
+                    if left_edge.is_space && space_penalty != 0 {
+                        total_cost = total_cost.saturating_add(space_penalty);
+                    }
 
                     // Record ALL transitions for N-Best
                     self.all_paths[stop_index].push(PathEntry {
@@ -779,6 +831,8 @@ impl Lattice {
     #[allow(clippy::too_many_arguments)]
     fn process_unknown_word_nbest(
         &mut self,
+        dict: &PrefixDictionary,
+        text: &str,
         char_definitions: &CharacterDefinition,
         unknown_dictionary: &UnknownDictionary,
         cost_matrix: &ConnectionCostMatrix,
@@ -824,14 +878,15 @@ impl Lattice {
 
             for &word_id in unknown_dictionary.lookup_word_ids(category) {
                 let word_entry = unknown_dictionary.word_entry(word_id);
-                let edge = Self::create_edge(
+                let mut edge = Self::create_edge(
                     EdgeType::UNKNOWN,
                     word_entry,
                     start,
                     start + byte_len,
                     kanji_only,
                 );
-                self.add_edge_in_lattice_nbest(edge, cost_matrix, search_mode);
+                edge.is_space = Self::is_whitespace_range(text, start, start + byte_len);
+                self.add_edge_in_lattice_nbest(edge, dict, cost_matrix, search_mode);
             }
             return Some(start + byte_len);
         }
@@ -990,9 +1045,10 @@ impl Lattice {
 
                     let prefix_len = end - start;
                     let kanji_only = self.is_kanji_all(char_idx, prefix_len);
-                    let edge =
+                    let mut edge =
                         Self::create_edge(EdgeType::KNOWN, word_entry, start, end, kanji_only);
-                    self.add_edge_in_lattice_nbest(edge, cost_matrix, search_mode);
+                    edge.is_space = Self::is_whitespace_range(text, start, end);
+                    self.add_edge_in_lattice_nbest(edge, dict, cost_matrix, search_mode);
                     found = true;
 
                     match_idx = next;
@@ -1007,6 +1063,8 @@ impl Lattice {
                 for category_ord in 0..num_categories {
                     let category = self.get_cached_category(char_idx, category_ord);
                     unknown_word_end = self.process_unknown_word_nbest(
+                        dict,
+                        text,
                         char_definitions,
                         unknown_dictionary,
                         cost_matrix,

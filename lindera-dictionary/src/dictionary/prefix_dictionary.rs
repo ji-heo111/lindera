@@ -1,3 +1,4 @@
+use byteorder::{ByteOrder, LittleEndian};
 use daachorse::DoubleArrayAhoCorasick;
 use rkyv::rancor::{Fallible, Source};
 use rkyv::with::{ArchiveWith, DeserializeWith, SerializeWith};
@@ -5,6 +6,37 @@ use rkyv::{Archive, Deserialize as RkyvDeserialize, Place, Serialize as RkyvSeri
 use serde::{Deserialize, Serialize};
 
 use crate::{LinderaResult, error::LinderaErrorKind, util::Data, viterbi::WordEntry};
+
+/// Compute Korean left-space-penalty cost for a given POS tag.
+///
+/// Mirrors mecab-ko's `left-space-penalty-factor` config in dicrc:
+///   `100,3000,120,6000,172,3000,...,210,6000,...`
+///
+/// posid → POS class mapping (from pos-id.def):
+///   100 = 어미 (E*)              → 3000
+///   120 = 조사 (J*)              → 6000
+///   172 = VCP                    → 3000
+///   183-185 = XSA/XSN/XSV        → 3000
+///   200 = Inflect E*             → 3000
+///   210 = Inflect J*             → 6000
+///   220-222 = Inflect XS*        → 3000
+///   230 = Inflect VCP            → 3000
+///
+/// For compound POS like "JC+VCP", uses the first segment.
+pub fn compute_korean_space_penalty(pos: &str) -> i16 {
+    let first = pos.split('+').next().unwrap_or(pos);
+    match first {
+        // Particles (조사) — highest penalty
+        "JC" | "JKB" | "JKC" | "JKG" | "JKO" | "JKQ" | "JKS" | "JKV" | "JX" => 6000,
+        // Endings (어미)
+        "EC" | "EF" | "EP" | "ETM" | "ETN" => 3000,
+        // Copula (긍정지정사)
+        "VCP" => 3000,
+        // Suffixes (접미사)
+        "XSA" | "XSN" | "XSV" => 3000,
+        _ => 0,
+    }
+}
 
 /// Match structure for common prefix iterator compatibility
 #[derive(Debug, Clone)]
@@ -107,6 +139,12 @@ pub struct PrefixDictionary {
     pub words_idx_data: Data,
     pub words_data: Data,
     pub is_system: bool,
+    /// Pre-computed left-space-penalty cost per word_id (Korean only).
+    /// Empty for non-Korean dictionaries.
+    /// Built at load time from POS tags via `compute_korean_space_penalty`.
+    #[serde(skip)]
+    #[rkyv(with = rkyv::with::Skip)]
+    pub space_penalty_table: Vec<i16>,
 }
 
 impl PrefixDictionary {
@@ -150,13 +188,64 @@ impl PrefixDictionary {
             LinderaErrorKind::Deserialize.with_error(anyhow::anyhow!(err.to_string()))
         })?;
 
-        Ok(PrefixDictionary {
+        let mut dict = PrefixDictionary {
             da,
             vals_data: vals_data.into(),
             words_idx_data: words_idx_data.into(),
             words_data: words_data.into(),
             is_system,
-        })
+            space_penalty_table: Vec::new(),
+        };
+        dict.build_space_penalty_table();
+        Ok(dict)
+    }
+
+    /// Build the per-word_id space-penalty lookup table from POS tags.
+    /// Run once at load time. For non-Korean dictionaries, all values stay 0.
+    pub fn build_space_penalty_table(&mut self) {
+        let num_entries = self.words_idx_data.len() / 4;
+        let mut table = Vec::with_capacity(num_entries);
+        for word_id in 0..num_entries {
+            let penalty = match self.get_first_detail(word_id as u32) {
+                Some(pos) => compute_korean_space_penalty(pos),
+                None => 0,
+            };
+            table.push(penalty);
+        }
+        self.space_penalty_table = table;
+    }
+
+    /// Read the first detail field (POS tag) for a given word_id.
+    /// Returns None if word_id is out of bounds or data is malformed.
+    pub fn get_first_detail(&self, word_id: u32) -> Option<&str> {
+        let idx_pos = (word_id as usize) * 4;
+        if idx_pos + 4 > self.words_idx_data.len() {
+            return None;
+        }
+        let idx = LittleEndian::read_u32(&self.words_idx_data[idx_pos..idx_pos + 4]) as usize;
+        if idx + 4 > self.words_data.len() {
+            return None;
+        }
+        let joined_len = LittleEndian::read_u32(&self.words_data[idx..idx + 4]) as usize;
+        let bytes_start = idx + 4;
+        let bytes_end = bytes_start + joined_len;
+        if bytes_end > self.words_data.len() {
+            return None;
+        }
+        let joined = &self.words_data[bytes_start..bytes_end];
+        let null_pos = joined.iter().position(|&b| b == 0).unwrap_or(joined.len());
+        std::str::from_utf8(&joined[..null_pos]).ok()
+    }
+
+    /// Look up the pre-computed left-space-penalty for a given word_id.
+    #[inline]
+    pub fn get_space_penalty(&self, word_id: u32) -> i32 {
+        let idx = word_id as usize;
+        if idx < self.space_penalty_table.len() {
+            self.space_penalty_table[idx] as i32
+        } else {
+            0
+        }
     }
 
     pub fn prefix<'a>(&'a self, s: &'a str) -> impl Iterator<Item = (usize, WordEntry)> + 'a {

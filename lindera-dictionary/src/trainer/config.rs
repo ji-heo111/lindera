@@ -507,6 +507,7 @@ impl TrainerConfig {
             words_idx_data: Data::from(vec![]),
             words_data: Data::from(vec![]),
             is_system: true,
+            space_penalty_table: Vec::new(),
         })
     }
 
